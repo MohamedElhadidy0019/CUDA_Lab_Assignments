@@ -1,5 +1,6 @@
 #!/bin/bash
 # mkdir -p build Output
+rm -f Output/*
 cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
