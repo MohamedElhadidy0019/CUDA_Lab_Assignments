@@ -1,0 +1,7 @@
+*.zip
+*.pcd
+*.pdf
+*.tar
+*.txt
+Assignment04_startup/build/
+Assignment04_startup/Output/
