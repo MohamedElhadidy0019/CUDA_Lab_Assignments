@@ -10,9 +10,183 @@
 #include <iostream>
 #include <unordered_set>
 #include <cuda_runtime.h>
-#include "chamfer.h"
-#include "voxelgrid.h"
-#include "raycasting.h"
+
+// ------------------------------------ RAY CASTING ------------------------------------
+// Structure to represent a 3D point
+struct Point3D {
+    float x, y, z;
+
+    Point3D operator+(const Point3D& other) const {
+        return { x + other.x, y + other.y, z + other.z };
+    }
+
+    Point3D operator-(const Point3D& other) const {
+        return { x - other.x, y - other.y, z - other.z };
+    }
+
+    Point3D operator*(float scalar) const {
+        return { x * scalar, y * scalar, z * scalar };
+    }
+};
+
+// Structure to represent a voxel grid
+struct VoxelGrid {
+    int sizeX, sizeY, sizeZ; // Number of voxels along each dimension
+    float voxelSize;         // Size of each voxel
+    std::vector<bool> grid;  // True indicates occupied, False indicates free space
+
+    VoxelGrid(int x, int y, int z, float size)
+        : sizeX(x), sizeY(y), sizeZ(z), voxelSize(size), grid(x* y* z, false) {}
+
+    // Convert voxel coordinates to grid vector index
+    int getIndex(int x, int y, int z) const {
+        if (x >= 0 && x < sizeX && y >= 0 && y < sizeY && z >= 0 && z < sizeZ) {
+            return x + y * sizeX + z * sizeX * sizeY;
+        }
+        return -1; // Invalid index
+    }
+
+    // Check if a voxel is occupied
+    bool isOccupied(int x, int y, int z) const {
+        int index = getIndex(x, y, z);
+        return index != -1 && grid[index];
+    }
+
+    // Set a voxel to occupied
+    void setOccupied(int x, int y, int z) {
+        int index = getIndex(x, y, z);
+        if (index != -1) {
+            grid[index] = true;
+        }
+    }
+
+    // Convert a Point3D to voxel grid coordinates
+    std::tuple<int, int, int> pointToGridIndex(const Point3D& point) const {
+        int x = static_cast<int>(point.x / voxelSize);
+        int y = static_cast<int>(point.y / voxelSize);
+        int z = static_cast<int>(point.z / voxelSize);
+        return { x, y, z };
+    }
+
+    // Convert voxel grid coordinates to a Point3D (center of the voxel)
+    Point3D gridIndexToPoint(int x, int y, int z) const {
+        float px = (x + 0.5f) * voxelSize;
+        float py = (y + 0.5f) * voxelSize;
+        float pz = (z + 0.5f) * voxelSize;
+        return { px, py, pz };
+    }
+
+    // Insert a point cloud into the voxel grid
+    void insertPointCloud(const std::vector<Point3D>& points) {
+        for (const auto& point : points) {
+            // Compute voxel coordinates from the point
+            std::tuple<int, int, int> voxelIndex = pointToGridIndex(point);
+            int x = std::get<0>(voxelIndex);
+            int y = std::get<1>(voxelIndex);
+            int z = std::get<2>(voxelIndex);
+            // Check if the point is within the valid range of the voxel grid
+            if (point.x < 0 || point.x >= voxelSize * sizeX ||
+                point.y < 0 || point.y >= voxelSize * sizeY ||
+                point.z < 0 || point.z >= voxelSize * sizeZ) {
+                std::cerr << "Point (" << point.x << ", " << point.y << ", " << point.z << ") is out of bounds. Skipping this point.\n";
+                continue; // Skip points that are out of bounds
+            }
+            // Set the corresponding voxel as occupied
+            setOccupied(x, y, z);
+        }
+    }
+
+    // Extract the point cloud
+    std::vector<Point3D> extractPointCloud() const {
+        std::vector<Point3D> pointCloud;
+        // Iterate through all voxels in the grid
+        for (int z = 0; z < sizeZ; ++z) {
+            for (int y = 0; y < sizeY; ++y) {
+                for (int x = 0; x < sizeX; ++x) {
+                    // Check if the voxel is occupied
+                    if (isOccupied(x, y, z)) {
+                        // Convert grid coordinates to the corresponding Point3D (center of the voxel)
+                        Point3D point = gridIndexToPoint(x, y, z);
+                        pointCloud.push_back(point);
+                    }
+                }
+            }
+        }
+        return pointCloud;
+    }
+
+    // Perform ray casting in the voxel grid
+    bool rayCasting(const Point3D& start, const Point3D& direction, Point3D& endPoint, float maxDistance) {
+        // Normalize the direction vector
+        Point3D normalizedDirection = direction * (1.0f / std::sqrt(direction.x * direction.x + direction.y * direction.y + direction.z * direction.z));
+
+        // Current position along the ray
+        Point3D current = start;
+        float stepSize = voxelSize / 2.0f; // Step size for ray traversal
+        float distance = 0.0f;            // Total traveled distance
+        
+        // Ray stop until hits an occupied voxel or exceeds the maxDistance
+        while (distance < maxDistance) {
+            // Convert the current position to voxel grid coordinates
+            std::tuple<int, int, int> voxelIndex = pointToGridIndex(current);
+            int x = std::get<0>(voxelIndex);
+            int y = std::get<1>(voxelIndex);
+            int z = std::get<2>(voxelIndex);
+
+            // Check if the current voxel is occupied
+            if (isOccupied(x, y, z)) {
+                //std::cout << "Hit at voxel (" << x << ", " << y << ", " << z << ")" << std::endl;
+                endPoint = gridIndexToPoint(x, y, z);
+                return true; // Hit an occupied voxel
+            }
+
+            // Move along the ray
+            current = current + normalizedDirection * stepSize;
+            distance += stepSize;
+        }
+
+        //std::cout << "No hit within max distance." << std::endl;
+        return false; // No hit within maxDistance
+    }
+
+};
+
+
+// ------------------------------------ CHAMFER DISTANCE ------------------------------------
+// Function to compute the Euclidean distance between two 3D points
+float euclidean_distance(const Point3D& p1, const Point3D& p2) {
+    return std::sqrt((p1.x - p2.x) * (p1.x - p2.x) +
+        (p1.y - p2.y) * (p1.y - p2.y) +
+        (p1.z - p2.z) * (p1.z - p2.z));
+}
+
+// Brute-force implementation of Chamfer Distance
+float chamfer_distance(const std::vector<Point3D>& cloud1, const std::vector<Point3D>& cloud2) {
+    float total_distance1 = 0.0f, total_distance2 = 0.0f;
+
+    // Find the shortest distance from each point in cloud1 to cloud2
+    for (const auto& p1 : cloud1) {
+        float min_distance = std::numeric_limits<float>::max();
+        for (const auto& p2 : cloud2) {
+            float dist = euclidean_distance(p1, p2);
+            if (dist < min_distance) min_distance = dist;
+        }
+        total_distance1 += min_distance;
+    }
+
+    // Find the shortest distance from each point in cloud2 to cloud1
+    for (const auto& p2 : cloud2) {
+        float min_distance = std::numeric_limits<float>::max();
+        for (const auto& p1 : cloud1) {
+            float dist = euclidean_distance(p2, p1);
+            if (dist < min_distance) min_distance = dist;
+        }
+        total_distance2 += min_distance;
+    }
+
+    // Return the normalized Chamfer Distance
+    return (total_distance1 / cloud1.size()) + (total_distance2 / cloud2.size());
+}
 
 
 // ------------------------------------ PCD FILE ------------------------------------
@@ -93,7 +267,7 @@ int main() {
     std::string model_path = "../Models/";
 
     std::vector<std::string> object_names;
-    // object_names.push_back("Armadillo");
+    object_names.push_back("Armadillo");
     object_names.push_back("Dragon");
 
     std::vector<Point3D> view_space;
@@ -109,8 +283,7 @@ int main() {
 		view_space.push_back(view_point);
 	}
 
-    // std::vector<int> num_voxels = {64, 128, 256};
-    std::vector<int> num_voxels = {256};
+    std::vector<int> num_voxels = {64, 128, 256};
 
     // For each object
     for (std::string object_name : object_names) {
@@ -127,17 +300,36 @@ int main() {
             VoxelGrid object_grid(num_voxel, num_voxel, num_voxel, voxel_size);
             object_grid.insertPointCloud(object_points);
 
-            // upload grid to GPU once before the viewpoint loop
-            uint8_t* d_grid = uploadGrid(object_grid);
-
             // For each view point, do ray casting to get the view space point cloud
             std::vector<std::vector<Point3D>> view_space_points;
             for (int i = 0; i < view_space.size(); i++) {
                 Point3D view_point = view_space[i];
-                auto rc_start = std::chrono::high_resolution_clock::now();
-                std::vector<Point3D> view_point_visible_points = rayCasting_viewpoint(object_grid, d_grid, view_point, 6.0f);
-                auto rc_end = std::chrono::high_resolution_clock::now();
-                std::cout << "Ray casting vp " << i << " time: " << std::chrono::duration<double>(rc_end - rc_start).count() << "s\n";
+                //std::cout << "Ray casting for view point " << std::to_string(i) << std::endl;
+                std::vector<Point3D> view_point_visible_points;
+                //traerse all voxels and remain occupied voxels as directions
+                for (int x = 0; x < num_voxel; x++) {
+                    for (int y = 0; y < num_voxel; y++) {
+                        for (int z = 0; z < num_voxel; z++) {
+                            // Check if voxel is occupied
+                            if (!object_grid.isOccupied(x, y, z)) {
+								continue;
+							}
+							// Get voxel center
+							Point3D voxel_center = object_grid.gridIndexToPoint(x, y, z);
+							// Get ray direction
+							Point3D ray_direction = voxel_center - view_point;
+							// Get ray origin
+							Point3D ray_origin = view_point;
+							// Ray cast
+							float max_distance = 6.0f;
+                            Point3D end_point;
+                            bool hit = object_grid.rayCasting(ray_origin, ray_direction, end_point, max_distance);
+                            if (hit) {
+                                view_point_visible_points.push_back(end_point);
+							}
+						}
+					}
+				}
                 // Remove duplicate points
                 std::unordered_set<std::tuple<int, int, int>, TupleHash> unique_points;
                 for (Point3D point : view_point_visible_points) {
@@ -159,8 +351,6 @@ int main() {
                 std::cout << "View point " << i << " has " << view_point_visible_points_unique.size() << " visible points" << std::endl;
                 view_space_points.push_back(view_point_visible_points_unique);
 			}
-            freeGrid(d_grid);
-
             // Save view space point cloud
             std::unordered_set<std::tuple<int, int, int>, TupleHash> all_visbile_points_set;
             for (int i = 0; i < view_space.size(); i++) {
@@ -249,12 +439,9 @@ int main() {
 				}
                 std::string reconstructed_file = "../Output/" + object_name + "_res" + std::to_string(num_voxel) + "_vp" + std::to_string(i) + "_nbv" + std::to_string(max_score_index) + ".pcd";
 				savePCD(reconstructed_file, reconstructed_points);
-                // Calculate chamfer distance
-                auto cd_start = std::chrono::high_resolution_clock::now();
+                // Calculate the chafer distance
                 double cd_before_nbv = chamfer_distance(all_visbile_points, view_point_visible_points);
                 double cd_after_nbv = chamfer_distance(all_visbile_points, reconstructed_points);
-                auto cd_end = std::chrono::high_resolution_clock::now();
-                std::cout << "Chamfer distance time: " << std::chrono::duration<double>(cd_end - cd_start).count() << "s\n";
                 std::cout << "Number of visible points before NBV: " << view_point_visible_points.size() << std::endl;
                 std::cout << "Chamfer distance before NBV: " << cd_before_nbv << std::endl;
                 std::cout << "Number of visible points after NBV: " << reconstructed_points.size() << std::endl;
@@ -270,6 +457,3 @@ int main() {
 
     return 0;
 }
-
-
-
